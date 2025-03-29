@@ -455,13 +455,13 @@ impl remote::SshClientDelegate for SshClientDelegate {
         version: Option<SemanticVersion>,
         cx: &mut AsyncApp,
     ) -> Task<anyhow::Result<PathBuf>> {
-        cx.spawn(|mut cx| async move {
+        cx.spawn(async move |cx| {
             let binary_path = AutoUpdater::download_remote_server_release(
                 platform.os,
                 platform.arch,
                 release_channel,
                 version,
-                &mut cx,
+                cx,
             )
             .await
             .map_err(|e| {
@@ -486,13 +486,13 @@ impl remote::SshClientDelegate for SshClientDelegate {
         version: Option<SemanticVersion>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Option<(String, String)>>> {
-        cx.spawn(|mut cx| async move {
+        cx.spawn(async move |cx| {
             AutoUpdater::get_remote_server_release_url(
                 platform.os,
                 platform.arch,
                 release_channel,
                 version,
-                &mut cx,
+                cx,
             )
             .await
         })
@@ -557,6 +557,7 @@ pub async fn open_ssh_project(
                 app_state.node_runtime.clone(),
                 app_state.user_store.clone(),
                 app_state.languages.clone(),
+                app_state.debug_adapters.clone(),
                 app_state.fs.clone(),
                 None,
                 cx,

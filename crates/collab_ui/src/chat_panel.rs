@@ -199,7 +199,7 @@ impl ChatPanel {
         workspace: WeakEntity<Workspace>,
         cx: AsyncWindowContext,
     ) -> Task<Result<Entity<Self>>> {
-        cx.spawn(|mut cx| async move {
+        cx.spawn(async move |cx| {
             let serialized_panel = if let Some(panel) = cx
                 .background_spawn(async move { KEY_VALUE_STORE.read_kvp(CHAT_PANEL_KEY) })
                 .await
@@ -211,7 +211,7 @@ impl ChatPanel {
                 None
             };
 
-            workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.update_in(cx, |workspace, window, cx| {
                 let panel = Self::new(workspace, window, cx);
                 if let Some(serialized_panel) = serialized_panel {
                     panel.update(cx, |panel, cx| {
@@ -867,10 +867,10 @@ impl ChatPanel {
                 })
             });
 
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             let chat = open_chat.await?;
             let highlight_message_id = scroll_to_message_id;
-            let scroll_to_message_id = this.update(&mut cx, |this, cx| {
+            let scroll_to_message_id = this.update(cx, |this, cx| {
                 this.set_active_chat(chat.clone(), cx);
 
                 scroll_to_message_id.or(this.last_acknowledged_message_id)
@@ -881,11 +881,11 @@ impl ChatPanel {
                     ChannelChat::load_history_since_message(chat.clone(), message_id, cx.clone())
                         .await
                 {
-                    this.update(&mut cx, |this, cx| {
+                    this.update(cx, |this, cx| {
                         if let Some(highlight_message_id) = highlight_message_id {
-                            let task = cx.spawn(|this, mut cx| async move {
+                            let task = cx.spawn(async move |this, cx| {
                                 cx.background_executor().timer(Duration::from_secs(2)).await;
-                                this.update(&mut cx, |this, cx| {
+                                this.update(cx, |this, cx| {
                                     this.highlighted_message.take();
                                     cx.notify();
                                 })
@@ -1156,20 +1156,7 @@ impl Panel for ChatPanel {
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<ui::IconName> {
-        let show_icon = match ChatPanelSettings::get_global(cx).button {
-            ChatPanelButton::Never => false,
-            ChatPanelButton::Always => true,
-            ChatPanelButton::WhenInCall => {
-                let is_in_call = ActiveCall::global(cx)
-                    .read(cx)
-                    .room()
-                    .map_or(false, |room| room.read(cx).contains_guests());
-
-                self.active || is_in_call
-            }
-        };
-
-        show_icon.then(|| ui::IconName::MessageBubbles)
+        self.enabled(cx).then(|| ui::IconName::MessageBubbles)
     }
 
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
@@ -1189,6 +1176,21 @@ impl Panel for ChatPanel {
 
     fn activation_priority(&self) -> u32 {
         7
+    }
+
+    fn enabled(&self, cx: &App) -> bool {
+        match ChatPanelSettings::get_global(cx).button {
+            ChatPanelButton::Never => false,
+            ChatPanelButton::Always => true,
+            ChatPanelButton::WhenInCall => {
+                let is_in_call = ActiveCall::global(cx)
+                    .read(cx)
+                    .room()
+                    .map_or(false, |room| room.read(cx).contains_guests());
+
+                self.active || is_in_call
+            }
+        }
     }
 }
 

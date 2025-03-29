@@ -1304,8 +1304,8 @@ impl Buffer {
     pub fn reload(&mut self, cx: &Context<Self>) -> oneshot::Receiver<Option<Transaction>> {
         let (tx, rx) = futures::channel::oneshot::channel();
         let prev_version = self.text.version();
-        self.reload_task = Some(cx.spawn(|this, mut cx| async move {
-            let Some((new_mtime, new_text)) = this.update(&mut cx, |this, cx| {
+        self.reload_task = Some(cx.spawn(async move |this, cx| {
+            let Some((new_mtime, new_text)) = this.update(cx, |this, cx| {
                 let file = this.file.as_ref()?.as_local()?;
                 Some((file.disk_state().mtime(), file.load(cx)))
             })?
@@ -1315,12 +1315,12 @@ impl Buffer {
 
             let new_text = new_text.await?;
             let diff = this
-                .update(&mut cx, |this, cx| this.diff(new_text.clone(), cx))?
+                .update(cx, |this, cx| this.diff(new_text.clone(), cx))?
                 .await;
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 if this.version() == diff.base_version {
                     this.finalize_last_transaction();
-                    this.apply_diff(diff, cx);
+                    this.apply_diff(diff, true, cx);
                     tx.send(this.finalize_last_transaction().cloned()).ok();
                     this.has_conflict = false;
                     this.did_reload(this.version(), this.line_ending(), new_mtime, cx);
@@ -1499,9 +1499,9 @@ impl Buffer {
                 self.reparse = None;
             }
             Err(parse_task) => {
-                self.reparse = Some(cx.spawn(move |this, mut cx| async move {
+                self.reparse = Some(cx.spawn(async move |this, cx| {
                     let new_syntax_map = parse_task.await;
-                    this.update(&mut cx, move |this, cx| {
+                    this.update(cx, move |this, cx| {
                         let grammar_changed =
                             this.language.as_ref().map_or(true, |current_language| {
                                 !Arc::ptr_eq(&language, current_language)
@@ -1557,6 +1557,13 @@ impl Buffer {
         self.send_operation(op, true, cx);
     }
 
+    pub fn get_diagnostics(&self, server_id: LanguageServerId) -> Option<&DiagnosticSet> {
+        let Ok(idx) = self.diagnostics.binary_search_by_key(&server_id, |v| v.0) else {
+            return None;
+        };
+        Some(&self.diagnostics[idx].1)
+    }
+
     fn request_autoindent(&mut self, cx: &mut Context<Self>) {
         if let Some(indent_sizes) = self.compute_autoindents() {
             let indent_sizes = cx.background_spawn(indent_sizes);
@@ -1566,9 +1573,9 @@ impl Buffer {
             {
                 Ok(indent_sizes) => self.apply_autoindents(indent_sizes, cx),
                 Err(indent_sizes) => {
-                    self.pending_autoindent = Some(cx.spawn(|this, mut cx| async move {
+                    self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
                         let indent_sizes = indent_sizes.await;
-                        this.update(&mut cx, |this, cx| {
+                        this.update(cx, |this, cx| {
                             this.apply_autoindents(indent_sizes, cx);
                         })
                         .ok();
@@ -1872,9 +1879,14 @@ impl Buffer {
     /// Applies a diff to the buffer. If the buffer has changed since the given diff was
     /// calculated, then adjust the diff to account for those changes, and discard any
     /// parts of the diff that conflict with those changes.
-    pub fn apply_diff(&mut self, diff: Diff, cx: &mut Context<Self>) -> Option<TransactionId> {
-        // Check for any edits to the buffer that have occurred since this diff
-        // was computed.
+    ///
+    /// If `atomic` is true, the diff will be applied as a single edit.
+    pub fn apply_diff(
+        &mut self,
+        diff: Diff,
+        atomic: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
         let snapshot = self.snapshot();
         let mut edits_since = snapshot.edits_since::<usize>(&diff.base_version).peekable();
         let mut delta = 0;
@@ -1904,7 +1916,17 @@ impl Buffer {
 
         self.start_transaction();
         self.text.set_line_ending(diff.line_ending);
-        self.edit(adjusted_edits, None, cx);
+        if atomic {
+            self.edit(adjusted_edits, None, cx);
+        } else {
+            let mut delta = 0isize;
+            for (range, new_text) in adjusted_edits {
+                let adjusted_range =
+                    (range.start as isize + delta) as usize..(range.end as isize + delta) as usize;
+                delta += new_text.len() as isize - range.len() as isize;
+                self.edit([(adjusted_range, new_text)], None, cx);
+            }
+        }
         self.end_transaction(cx)
     }
 
@@ -1928,13 +1950,14 @@ impl Buffer {
         if self.capability == Capability::ReadOnly {
             return false;
         }
-        if self.has_conflict || self.has_unsaved_edits() {
+        if self.has_conflict {
             return true;
         }
         match self.file.as_ref().map(|f| f.disk_state()) {
-            Some(DiskState::New) => !self.is_empty(),
-            Some(DiskState::Deleted) => true,
-            _ => false,
+            Some(DiskState::New) | Some(DiskState::Deleted) => {
+                !self.is_empty() && self.has_unsaved_edits()
+            }
+            _ => self.has_unsaved_edits(),
         }
     }
 
@@ -1955,7 +1978,7 @@ impl Buffer {
                 }
                 None => true,
             },
-            DiskState::Deleted => true,
+            DiskState::Deleted => false,
         }
     }
 
@@ -2160,8 +2183,10 @@ impl Buffer {
     {
         // Skip invalid edits and coalesce contiguous ones.
         let mut edits: Vec<(Range<usize>, Arc<str>)> = Vec::new();
+
         for (range, new_text) in edits_iter {
             let mut range = range.start.to_offset(self)..range.end.to_offset(self);
+
             if range.start > range.end {
                 mem::swap(&mut range.start, &mut range.end);
             }
@@ -4146,12 +4171,9 @@ impl BufferSnapshot {
         }
     }
 
-    pub fn words_in_range(
-        &self,
-        query: Option<&str>,
-        range: Range<usize>,
-    ) -> HashMap<String, Range<Anchor>> {
-        if query.map_or(false, |query| query.is_empty()) {
+    pub fn words_in_range(&self, query: WordsQuery) -> HashMap<String, Range<Anchor>> {
+        let query_str = query.fuzzy_contents;
+        if query_str.map_or(false, |query| query.is_empty()) {
             return HashMap::default();
         }
 
@@ -4161,13 +4183,13 @@ impl BufferSnapshot {
         }));
 
         let mut query_ix = 0;
-        let query = query.map(|query| query.chars().collect::<Vec<_>>());
-        let query_len = query.as_ref().map_or(0, |query| query.len());
+        let query_chars = query_str.map(|query| query.chars().collect::<Vec<_>>());
+        let query_len = query_chars.as_ref().map_or(0, |query| query.len());
 
         let mut words = HashMap::default();
         let mut current_word_start_ix = None;
-        let mut chunk_ix = range.start;
-        for chunk in self.chunks(range, false) {
+        let mut chunk_ix = query.range.start;
+        for chunk in self.chunks(query.range, false) {
             for (i, c) in chunk.text.char_indices() {
                 let ix = chunk_ix + i;
                 if classifier.is_word(c) {
@@ -4175,12 +4197,9 @@ impl BufferSnapshot {
                         current_word_start_ix = Some(ix);
                     }
 
-                    if let Some(query) = &query {
+                    if let Some(query_chars) = &query_chars {
                         if query_ix < query_len {
-                            let query_c = query.get(query_ix).expect(
-                                "query_ix is a vec of chars, which we access only if before the end",
-                            );
-                            if c.to_lowercase().eq(query_c.to_lowercase()) {
+                            if c.to_lowercase().eq(query_chars[query_ix].to_lowercase()) {
                                 query_ix += 1;
                             }
                         }
@@ -4189,10 +4208,16 @@ impl BufferSnapshot {
                 } else if let Some(word_start) = current_word_start_ix.take() {
                     if query_ix == query_len {
                         let word_range = self.anchor_before(word_start)..self.anchor_after(ix);
-                        words.insert(
-                            self.text_for_range(word_start..ix).collect::<String>(),
-                            word_range,
-                        );
+                        let mut word_text = self.text_for_range(word_start..ix).peekable();
+                        let first_char = word_text
+                            .peek()
+                            .and_then(|first_chunk| first_chunk.chars().next());
+                        // Skip empty and "words" starting with digits as a heuristic to reduce useless completions
+                        if !query.skip_digits
+                            || first_char.map_or(true, |first_char| !first_char.is_digit(10))
+                        {
+                            words.insert(word_text.collect(), word_range);
+                        }
                     }
                 }
                 query_ix = 0;
@@ -4202,6 +4227,15 @@ impl BufferSnapshot {
 
         words
     }
+}
+
+pub struct WordsQuery<'a> {
+    /// Only returns words with all chars from the fuzzy string in them.
+    pub fuzzy_contents: Option<&'a str>,
+    /// Skips words that start with a digit.
+    pub skip_digits: bool,
+    /// Buffer offset range, to look for words.
+    pub range: Range<usize>,
 }
 
 fn indent_size_for_line(text: &text::BufferSnapshot, row: u32) -> IndentSize {
@@ -4718,21 +4752,25 @@ impl CharClassifier {
     }
 
     pub fn kind_with(&self, c: char, ignore_punctuation: bool) -> CharKind {
-        if c.is_whitespace() {
-            return CharKind::Whitespace;
-        } else if c.is_alphanumeric() || c == '_' {
+        if c.is_alphanumeric() || c == '_' {
             return CharKind::Word;
         }
 
         if let Some(scope) = &self.scope {
-            if let Some(characters) = scope.word_characters() {
+            let characters = if self.for_completion {
+                scope.completion_query_characters()
+            } else {
+                scope.word_characters()
+            };
+            if let Some(characters) = characters {
                 if characters.contains(&c) {
-                    if c == '-' && !self.for_completion && !ignore_punctuation {
-                        return CharKind::Punctuation;
-                    }
                     return CharKind::Word;
                 }
             }
+        }
+
+        if c.is_whitespace() {
+            return CharKind::Whitespace;
         }
 
         if ignore_punctuation {

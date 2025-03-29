@@ -3,6 +3,7 @@ use crate::HeadlessProject;
 use anyhow::{anyhow, Context as _, Result};
 use chrono::Utc;
 use client::{telemetry, ProxySettings};
+use dap::DapRegistry;
 use extension::ExtensionHostProxy;
 use fs::{Fs, RealFs};
 use futures::channel::mpsc;
@@ -272,7 +273,7 @@ fn start_server(
     })
     .detach();
 
-    cx.spawn(|cx| async move {
+    cx.spawn(async move |cx| {
         let mut stdin_incoming = listeners.stdin.incoming();
         let mut stdout_incoming = listeners.stdout.incoming();
         let mut stderr_incoming = listeners.stderr.incoming();
@@ -445,7 +446,7 @@ pub fn execute_run(
         let extension_host_proxy = ExtensionHostProxy::global(cx);
 
         let project = cx.new(|cx| {
-            let fs = Arc::new(RealFs::new(None));
+            let fs = Arc::new(RealFs::new(None, cx.background_executor().clone()));
             let node_settings_rx = initialize_settings(session.clone(), fs.clone(), cx);
 
             let proxy_url = read_proxy_settings(cx);
@@ -471,6 +472,7 @@ pub fn execute_run(
             let mut languages = LanguageRegistry::new(cx.background_executor().clone());
             languages.set_language_server_download_dir(paths::languages_dir().clone());
             let languages = Arc::new(languages);
+            let debug_adapters = DapRegistry::default().into();
 
             HeadlessProject::new(
                 HeadlessAppState {
@@ -479,6 +481,7 @@ pub fn execute_run(
                     http_client,
                     node_runtime,
                     languages,
+                    debug_adapters,
                     extension_host_proxy,
                 },
                 cx,
@@ -827,7 +830,7 @@ pub fn handle_settings_file_changes(
             .set_server_settings(&server_settings_content, cx)
             .log_err();
     });
-    cx.spawn(move |cx| async move {
+    cx.spawn(async move |cx| {
         while let Some(server_settings_content) = server_settings_file.next().await {
             let result = cx.update_global(|store: &mut SettingsStore, cx| {
                 let result = store.set_server_settings(&server_settings_content, cx);
@@ -845,7 +848,7 @@ pub fn handle_settings_file_changes(
     .detach();
 }
 
-fn read_proxy_settings(cx: &mut Context<'_, HeadlessProject>) -> Option<Uri> {
+fn read_proxy_settings(cx: &mut Context<HeadlessProject>) -> Option<Uri> {
     let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
     let proxy_url = proxy_str
         .as_ref()
