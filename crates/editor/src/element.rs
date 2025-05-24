@@ -1,12 +1,12 @@
 use crate::{
     ActiveDiagnostic, BlockId, COLUMNAR_SELECTION_MODIFIERS, CURSORS_VISIBLE_FOR,
-    ChunkRendererContext, ChunkReplacement, ConflictsOurs, ConflictsOursMarker, ConflictsOuter,
-    ConflictsTheirs, ConflictsTheirsMarker, ContextMenuPlacement, CursorShape, CustomBlockId,
-    DisplayDiffHunk, DisplayPoint, DisplayRow, DocumentHighlightRead, DocumentHighlightWrite,
-    EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle,
-    FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput,
-    HoveredCursor, InlayHintRefreshReason, InlineCompletion, JumpData, LineDown, LineHighlight,
-    LineUp, MAX_LINE_LEN, MIN_LINE_NUMBER_DIGITS, MINIMAP_FONT_SIZE,
+    ChunkRendererContext, ChunkReplacement, CodeActionSource, ConflictsOurs, ConflictsOursMarker,
+    ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker, ContextMenuPlacement, CursorShape,
+    CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow, DocumentHighlightRead,
+    DocumentHighlightWrite, EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot,
+    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
+    HandleInput, HoveredCursor, InlayHintRefreshReason, InlineCompletion, JumpData, LineDown,
+    LineHighlight, LineUp, MAX_LINE_LEN, MIN_LINE_NUMBER_DIGITS, MINIMAP_FONT_SIZE,
     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, PageDown, PageUp, PhantomBreakpointIndicator,
     Point, RowExt, RowRangeExt, SelectPhase, SelectedTextHighlight, Selection, SoftWrap,
     StickyHeaderExcerpt, ToPoint, ToggleFold,
@@ -426,8 +426,15 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_indent_guides);
         register_action(editor, window, Editor::toggle_inlay_hints);
         register_action(editor, window, Editor::toggle_edit_predictions);
-        register_action(editor, window, Editor::toggle_inline_diagnostics);
-        register_action(editor, window, Editor::toggle_minimap);
+        if editor.read(cx).diagnostics_enabled() {
+            register_action(editor, window, Editor::toggle_diagnostics);
+        }
+        if editor.read(cx).inline_diagnostics_enabled() {
+            register_action(editor, window, Editor::toggle_inline_diagnostics);
+        }
+        if editor.read(cx).supports_minimap(cx) {
+            register_action(editor, window, Editor::toggle_minimap);
+        }
         register_action(editor, window, hover_popover::hover);
         register_action(editor, window, Editor::reveal_in_finder);
         register_action(editor, window, Editor::copy_path);
@@ -2385,7 +2392,7 @@ impl EditorElement {
         self.editor.update(cx, |editor, cx| {
             let active_task_indicator_row =
                 if let Some(crate::CodeContextMenu::CodeActions(CodeActionsMenu {
-                    deployed_from_indicator,
+                    deployed_from,
                     actions,
                     ..
                 })) = editor.context_menu.borrow().as_ref()
@@ -2393,7 +2400,10 @@ impl EditorElement {
                     actions
                         .tasks()
                         .map(|tasks| tasks.position.to_display_point(snapshot).row())
-                        .or(*deployed_from_indicator)
+                        .or_else(|| match deployed_from {
+                            Some(CodeActionSource::Indicator(row)) => Some(*row),
+                            _ => None,
+                        })
                 } else {
                     None
                 };
@@ -5535,7 +5545,9 @@ impl EditorElement {
 
                         editor.scroll_manager.show_scrollbars(window, cx);
                         cx.stop_propagation();
-                    } else if let Some((layout, axis)) = scrollbars_layout.get_hovered_axis(window)
+                    } else if let Some((layout, axis)) = scrollbars_layout
+                        .get_hovered_axis(window)
+                        .filter(|_| !event.dragging())
                     {
                         if layout
                             .thumb_bounds
@@ -7178,9 +7190,14 @@ impl Element for EditorElement {
         None
     }
 
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
     fn request_layout(
         &mut self,
         _: Option<&GlobalElementId>,
+        __inspector_id: Option<&gpui::InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, ()) {
@@ -7287,6 +7304,7 @@ impl Element for EditorElement {
     fn prepaint(
         &mut self,
         _: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
@@ -7758,7 +7776,7 @@ impl Element for EditorElement {
                         // If the fold widths have changed, we need to prepaint
                         // the element again to account for any changes in
                         // wrapping.
-                        return self.prepaint(None, bounds, &mut (), window, cx);
+                        return self.prepaint(None, _inspector_id, bounds, &mut (), window, cx);
                     }
 
                     let longest_line_blame_width = self
@@ -7843,7 +7861,7 @@ impl Element for EditorElement {
                             self.editor.update(cx, |editor, cx| {
                                 editor.resize_blocks(resized_blocks, autoscroll_request, cx)
                             });
-                            return self.prepaint(None, bounds, &mut (), window, cx);
+                            return self.prepaint(None, _inspector_id, bounds, &mut (), window, cx);
                         }
                     };
 
@@ -8342,6 +8360,7 @@ impl Element for EditorElement {
     fn paint(
         &mut self,
         _: Option<&GlobalElementId>,
+        __inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<gpui::Pixels>,
         _: &mut Self::RequestLayoutState,
         layout: &mut Self::PrepaintState,
