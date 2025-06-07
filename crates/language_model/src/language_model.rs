@@ -242,27 +242,8 @@ pub trait LanguageModel: Send + Sync {
     /// Whether this model supports choosing which tool to use.
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool;
 
-    /// Returns whether this model supports "max mode";
+    /// Returns whether this model supports "burn mode";
     fn supports_max_mode(&self) -> bool {
-        if self.provider_id().0 != ZED_CLOUD_PROVIDER_ID {
-            return false;
-        }
-
-        const MAX_MODE_CAPABLE_MODELS: &[CloudModel] = &[
-            CloudModel::Anthropic(anthropic::Model::ClaudeOpus4),
-            CloudModel::Anthropic(anthropic::Model::ClaudeOpus4Thinking),
-            CloudModel::Anthropic(anthropic::Model::ClaudeSonnet4),
-            CloudModel::Anthropic(anthropic::Model::ClaudeSonnet4Thinking),
-            CloudModel::Anthropic(anthropic::Model::Claude3_7Sonnet),
-            CloudModel::Anthropic(anthropic::Model::Claude3_7SonnetThinking),
-        ];
-
-        for model in MAX_MODE_CAPABLE_MODELS {
-            if self.id().0 == model.id() {
-                return true;
-            }
-        }
-
         false
     }
 
@@ -393,7 +374,6 @@ pub trait LanguageModelProvider: 'static {
     fn recommended_models(&self, _cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         Vec::new()
     }
-    fn load_model(&self, _model: Arc<dyn LanguageModel>, _cx: &App) {}
     fn is_authenticated(&self, cx: &App) -> bool;
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>>;
     fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView;
