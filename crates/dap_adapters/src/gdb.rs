@@ -26,10 +26,12 @@ impl DebugAdapter for GdbDebugAdapter {
 
         match &zed_scenario.request {
             dap::DebugRequest::Attach(attach) => {
+                obj.insert("request".into(), "attach".into());
                 obj.insert("pid".into(), attach.process_id.into());
             }
 
             dap::DebugRequest::Launch(launch) => {
+                obj.insert("request".into(), "launch".into());
                 obj.insert("program".into(), launch.program.clone().into());
 
                 if !launch.args.is_empty() {
@@ -175,18 +177,23 @@ impl DebugAdapter for GdbDebugAdapter {
 
         let gdb_path = user_setting_path.unwrap_or(gdb_path?);
 
-        let request_args = StartDebuggingRequestArguments {
-            request: self.validate_config(&config.config)?,
-            configuration: config.config.clone(),
-        };
+        let mut configuration = config.config.clone();
+        if let Some(configuration) = configuration.as_object_mut() {
+            configuration
+                .entry("cwd")
+                .or_insert_with(|| delegate.worktree_root_path().to_string_lossy().into());
+        }
 
         Ok(DebugAdapterBinary {
-            command: gdb_path,
+            command: Some(gdb_path),
             arguments: vec!["-i=dap".into()],
             envs: HashMap::default(),
             cwd: Some(delegate.worktree_root_path().to_path_buf()),
             connection: None,
-            request_args,
+            request_args: StartDebuggingRequestArguments {
+                request: self.request_kind(&config.config)?,
+                configuration,
+            },
         })
     }
 }

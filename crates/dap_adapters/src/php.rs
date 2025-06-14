@@ -47,13 +47,6 @@ impl PhpDebugAdapter {
         })
     }
 
-    fn validate_config(
-        &self,
-        _: &serde_json::Value,
-    ) -> Result<StartDebuggingRequestArgumentsRequest> {
-        Ok(StartDebuggingRequestArgumentsRequest::Launch)
-    }
-
     async fn get_installed_binary(
         &self,
         delegate: &Arc<dyn DapDelegate>,
@@ -78,13 +71,21 @@ impl PhpDebugAdapter {
         let tcp_connection = task_definition.tcp_connection.clone().unwrap_or_default();
         let (host, port, timeout) = crate::configure_tcp_connection(tcp_connection).await?;
 
+        let mut configuration = task_definition.config.clone();
+        if let Some(obj) = configuration.as_object_mut() {
+            obj.entry("cwd")
+                .or_insert_with(|| delegate.worktree_root_path().to_string_lossy().into());
+        }
+
         Ok(DebugAdapterBinary {
-            command: delegate
-                .node_runtime()
-                .binary_path()
-                .await?
-                .to_string_lossy()
-                .into_owned(),
+            command: Some(
+                delegate
+                    .node_runtime()
+                    .binary_path()
+                    .await?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             arguments: vec![
                 adapter_path
                     .join(Self::ADAPTER_PATH)
@@ -100,8 +101,8 @@ impl PhpDebugAdapter {
             cwd: Some(delegate.worktree_root_path().to_path_buf()),
             envs: HashMap::default(),
             request_args: StartDebuggingRequestArguments {
-                configuration: task_definition.config.clone(),
-                request: self.validate_config(&task_definition.config)?,
+                configuration,
+                request: <Self as DebugAdapter>::request_kind(self, &task_definition.config)?,
             },
         })
     }
@@ -156,22 +157,8 @@ impl DebugAdapter for PhpDebugAdapter {
                     "default": false
                 },
                 "pathMappings": {
-                    "type": "array",
-                    "description": "A list of server paths mapping to the local source paths on your machine for remote host debugging",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "serverPath": {
-                                "type": "string",
-                                "description": "Path on the server"
-                            },
-                            "localPath": {
-                                "type": "string",
-                                "description": "Corresponding path on the local machine"
-                            }
-                        },
-                        "required": ["serverPath", "localPath"]
-                    }
+                    "type": "object",
+                    "description": "A mapping of server paths to local paths.",
                 },
                 "log": {
                     "type": "boolean",
@@ -301,6 +288,10 @@ impl DebugAdapter for PhpDebugAdapter {
 
     fn adapter_language_name(&self) -> Option<LanguageName> {
         Some(SharedString::new_static("PHP").into())
+    }
+
+    fn request_kind(&self, _: &serde_json::Value) -> Result<StartDebuggingRequestArgumentsRequest> {
+        Ok(StartDebuggingRequestArgumentsRequest::Launch)
     }
 
     fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {

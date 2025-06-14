@@ -374,6 +374,12 @@ impl super::LspAdapter for GoLspAdapter {
             filter_range,
         })
     }
+
+    fn diagnostic_message_to_markdown(&self, message: &str) -> Option<String> {
+        static REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?m)\n\s*").expect("Failed to create REGEX"));
+        Some(REGEX.replace_all(message, "\n\n").to_string())
+    }
 }
 
 fn parse_version_output(output: &Output) -> Result<&str> {
@@ -438,12 +444,13 @@ impl ContextProvider for GoContextProvider {
     fn build_context(
         &self,
         variables: &TaskVariables,
-        location: &Location,
+        location: ContextLocation<'_>,
         _: Option<HashMap<String, String>>,
         _: Arc<dyn LanguageToolchainStore>,
         cx: &mut gpui::App,
     ) -> Task<Result<TaskVariables>> {
         let local_abs_path = location
+            .file_location
             .buffer
             .read(cx)
             .file()
@@ -503,9 +510,10 @@ impl ContextProvider for GoContextProvider {
 
     fn associated_tasks(
         &self,
-        _: Option<Arc<dyn language::File>>,
+        _: Arc<dyn Fs>,
+        _: Option<Arc<dyn File>>,
         _: &App,
-    ) -> Option<TaskTemplates> {
+    ) -> Task<Option<TaskTemplates>> {
         let package_cwd = if GO_PACKAGE_TASK_VARIABLE.template_value() == "." {
             None
         } else {
@@ -513,7 +521,7 @@ impl ContextProvider for GoContextProvider {
         };
         let module_cwd = Some(GO_MODULE_ROOT_TASK_VARIABLE.template_value());
 
-        Some(TaskTemplates(vec![
+        Task::ready(Some(TaskTemplates(vec![
             TaskTemplate {
                 label: format!(
                     "go test {} -run {}",
@@ -624,7 +632,7 @@ impl ContextProvider for GoContextProvider {
                 cwd: module_cwd.clone(),
                 ..TaskTemplate::default()
             },
-        ]))
+        ])))
     }
 }
 

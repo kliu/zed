@@ -49,7 +49,6 @@ pub struct User {
     pub github_login: String,
     pub avatar_uri: SharedUri,
     pub name: Option<String>,
-    pub email: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +57,8 @@ pub struct Collaborator {
     pub replica_id: ReplicaId,
     pub user_id: UserId,
     pub is_host: bool,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
 }
 
 impl PartialOrd for User {
@@ -108,6 +109,8 @@ pub struct UserStore {
     edit_predictions_usage_amount: Option<u32>,
     edit_predictions_usage_limit: Option<proto::UsageLimit>,
     is_usage_based_billing_enabled: Option<bool>,
+    account_too_young: Option<bool>,
+    has_overdue_invoices: Option<bool>,
     current_user: watch::Receiver<Option<Arc<User>>>,
     accepted_tos_at: Option<Option<DateTime<Utc>>>,
     contacts: Vec<Arc<Contact>>,
@@ -174,6 +177,8 @@ impl UserStore {
             edit_predictions_usage_amount: None,
             edit_predictions_usage_limit: None,
             is_usage_based_billing_enabled: None,
+            account_too_young: None,
+            has_overdue_invoices: None,
             accepted_tos_at: None,
             contacts: Default::default(),
             incoming_contact_requests: Default::default(),
@@ -320,7 +325,7 @@ impl UserStore {
         message: TypedEnvelope<proto::UpdateContacts>,
         mut cx: AsyncApp,
     ) -> Result<()> {
-        this.update(&mut cx, |this, _| {
+        this.read_with(&mut cx, |this, _| {
             this.update_contacts_tx
                 .unbounded_send(UpdateContacts::Update(message.payload))
                 .unwrap();
@@ -347,6 +352,8 @@ impl UserStore {
                 .trial_started_at
                 .and_then(|trial_started_at| DateTime::from_timestamp(trial_started_at as i64, 0));
             this.is_usage_based_billing_enabled = message.payload.is_usage_based_billing_enabled;
+            this.account_too_young = message.payload.account_too_young;
+            this.has_overdue_invoices = message.payload.has_overdue_invoices;
 
             if let Some(usage) = message.payload.usage {
                 this.model_request_usage_amount = Some(usage.model_requests_usage_amount);
@@ -654,7 +661,7 @@ impl UserStore {
                 .await?;
             }
 
-            this.update(cx, |this, _| {
+            this.read_with(cx, |this, _| {
                 user_ids
                     .iter()
                     .map(|user_id| {
@@ -697,7 +704,7 @@ impl UserStore {
         let load_users = self.get_users(vec![user_id], cx);
         cx.spawn(async move |this, cx| {
             load_users.await?;
-            this.update(cx, |this, _| {
+            this.read_with(cx, |this, _| {
                 this.users
                     .get(&user_id)
                     .cloned()
@@ -750,6 +757,16 @@ impl UserStore {
 
     pub fn watch_current_user(&self) -> watch::Receiver<Option<Arc<User>>> {
         self.current_user.clone()
+    }
+
+    /// Returns whether the user's account is too new to use the service.
+    pub fn account_too_young(&self) -> bool {
+        self.account_too_young.unwrap_or(false)
+    }
+
+    /// Returns whether the current user has overdue invoices and usage should be blocked.
+    pub fn has_overdue_invoices(&self) -> bool {
+        self.has_overdue_invoices.unwrap_or(false)
     }
 
     pub fn current_user_has_accepted_terms(&self) -> Option<bool> {
@@ -865,7 +882,6 @@ impl User {
             github_login: message.github_login,
             avatar_uri: message.avatar_url.into(),
             name: message.name,
-            email: message.email,
         })
     }
 }
@@ -896,6 +912,8 @@ impl Collaborator {
             replica_id: message.replica_id as ReplicaId,
             user_id: message.user_id as UserId,
             is_host: message.is_host,
+            committer_name: message.committer_name,
+            committer_email: message.committer_email,
         })
     }
 }

@@ -5,14 +5,14 @@ mod tool_picker;
 
 use std::{sync::Arc, time::Duration};
 
-use assistant_settings::AssistantSettings;
+use agent_settings::AgentSettings;
 use assistant_tool::{ToolSource, ToolWorkingSet};
 use collections::HashMap;
 use context_server::ContextServerId;
 use fs::Fs;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyView, App, Entity, EventEmitter, FocusHandle,
-    Focusable, ScrollHandle, Subscription, pulsating_between,
+    Focusable, ScrollHandle, Subscription, Transformation, percentage,
 };
 use language_model::{LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry};
 use project::context_server_store::{ContextServerStatus, ContextServerStore};
@@ -249,7 +249,7 @@ impl AgentConfiguration {
     }
 
     fn render_command_permission(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let always_allow_tool_actions = AssistantSettings::get_global(cx).always_allow_tool_actions;
+        let always_allow_tool_actions = AgentSettings::get_global(cx).always_allow_tool_actions;
 
         h_flex()
             .gap_4()
@@ -277,7 +277,7 @@ impl AgentConfiguration {
                     let fs = self.fs.clone();
                     move |state, _window, cx| {
                         let allow = state == &ToggleState::Selected;
-                        update_settings_file::<AssistantSettings>(
+                        update_settings_file::<AgentSettings>(
                             fs.clone(),
                             cx,
                             move |settings, _| {
@@ -290,7 +290,7 @@ impl AgentConfiguration {
     }
 
     fn render_single_file_review(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let single_file_review = AssistantSettings::get_global(cx).single_file_review;
+        let single_file_review = AgentSettings::get_global(cx).single_file_review;
 
         h_flex()
             .gap_4()
@@ -315,11 +315,49 @@ impl AgentConfiguration {
                         let fs = self.fs.clone();
                         move |state, _window, cx| {
                             let allow = state == &ToggleState::Selected;
-                            update_settings_file::<AssistantSettings>(
+                            update_settings_file::<AgentSettings>(
                                 fs.clone(),
                                 cx,
                                 move |settings, _| {
                                     settings.set_single_file_review(allow);
+                                },
+                            );
+                        }
+                    }),
+            )
+    }
+
+    fn render_sound_notification(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let play_sound_when_agent_done = AgentSettings::get_global(cx).play_sound_when_agent_done;
+
+        h_flex()
+            .gap_4()
+            .justify_between()
+            .flex_wrap()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .max_w_5_6()
+                    .child(Label::new("Play sound when finished generating"))
+                    .child(
+                        Label::new(
+                            "Hear a notification sound when the agent is done generating changes or needs your input.",
+                        )
+                        .color(Color::Muted),
+                    ),
+            )
+            .child(
+                Switch::new("play-sound-notification-switch", play_sound_when_agent_done.into())
+                    .color(SwitchColor::Accent)
+                    .on_click({
+                        let fs = self.fs.clone();
+                        move |state, _window, cx| {
+                            let allow = state == &ToggleState::Selected;
+                            update_settings_file::<AgentSettings>(
+                                fs.clone(),
+                                cx,
+                                move |settings, _| {
+                                    settings.set_play_sound_when_agent_done(allow);
                                 },
                             );
                         }
@@ -337,6 +375,7 @@ impl AgentConfiguration {
             .child(Headline::new("General Settings"))
             .child(self.render_command_permission(cx))
             .child(self.render_single_file_review(cx))
+            .child(self.render_sound_notification(cx))
     }
 
     fn render_context_servers_section(
@@ -436,7 +475,6 @@ impl AgentConfiguration {
             .get(&context_server_id)
             .copied()
             .unwrap_or_default();
-
         let tools = tools_by_source
             .get(&ToolSource::ContextServer {
                 id: context_server_id.0.clone().into(),
@@ -445,25 +483,23 @@ impl AgentConfiguration {
         let tool_count = tools.len();
 
         let border_color = cx.theme().colors().border.opacity(0.6);
-        let success_color = Color::Success.color(cx);
 
         let (status_indicator, tooltip_text) = match server_status {
             ContextServerStatus::Starting => (
-                Indicator::dot()
-                    .color(Color::Success)
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Accent)
                     .with_animation(
                         SharedString::from(format!("{}-starting", context_server_id.0.clone(),)),
-                        Animation::new(Duration::from_secs(2))
-                            .repeat()
-                            .with_easing(pulsating_between(0.4, 1.)),
-                        move |this, delta| this.color(success_color.alpha(delta).into()),
+                        Animation::new(Duration::from_secs(3)).repeat(),
+                        |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
                     )
                     .into_any_element(),
                 "Server is starting.",
             ),
             ContextServerStatus::Running => (
                 Indicator::dot().color(Color::Success).into_any_element(),
-                "Server is running.",
+                "Server is active.",
             ),
             ContextServerStatus::Error(_) => (
                 Indicator::dot().color(Color::Error).into_any_element(),
@@ -487,12 +523,11 @@ impl AgentConfiguration {
                     .p_1()
                     .justify_between()
                     .when(
-                        error.is_some() || are_tools_expanded && tool_count > 1,
+                        error.is_some() || are_tools_expanded && tool_count >= 1,
                         |element| element.border_b_1().border_color(border_color),
                     )
                     .child(
                         h_flex()
-                            .gap_1p5()
                             .child(
                                 Disclosure::new(
                                     "tool-list-disclosure",
@@ -512,12 +547,16 @@ impl AgentConfiguration {
                                 })),
                             )
                             .child(
-                                div()
-                                    .id(item_id.clone())
+                                h_flex()
+                                    .id(SharedString::from(format!("tooltip-{}", item_id)))
+                                    .h_full()
+                                    .w_3()
+                                    .mx_1()
+                                    .justify_center()
                                     .tooltip(Tooltip::text(tooltip_text))
                                     .child(status_indicator),
                             )
-                            .child(Label::new(context_server_id.0.clone()).ml_0p5())
+                            .child(Label::new(item_id).ml_0p5().mr_1p5())
                             .when(is_running, |this| {
                                 this.child(
                                     Label::new(if tool_count == 1 {

@@ -1,20 +1,88 @@
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, bail};
 use dap::{
-    StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest,
-    adapters::DebugTaskDefinition,
+    StartDebuggingRequestArguments,
+    adapters::{
+        DebugTaskDefinition, DownloadedFileType, TcpArguments, download_adapter_from_github,
+        latest_github_release,
+    },
 };
 
 use gpui::{AsyncApp, SharedString};
 use language::LanguageName;
-use std::{collections::HashMap, ffi::OsStr, path::PathBuf};
+use std::{collections::HashMap, env::consts, ffi::OsStr, path::PathBuf, sync::OnceLock};
+use task::TcpArgumentsTemplate;
+use util;
 
 use crate::*;
 
 #[derive(Default, Debug)]
-pub(crate) struct GoDebugAdapter;
+pub(crate) struct GoDebugAdapter {
+    shim_path: OnceLock<PathBuf>,
+}
 
 impl GoDebugAdapter {
     const ADAPTER_NAME: &'static str = "Delve";
+    async fn fetch_latest_adapter_version(
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
+        let release = latest_github_release(
+            &"zed-industries/delve-shim-dap",
+            true,
+            false,
+            delegate.http_client(),
+        )
+        .await?;
+
+        let os = match consts::OS {
+            "macos" => "apple-darwin",
+            "linux" => "unknown-linux-gnu",
+            "windows" => "pc-windows-msvc",
+            other => bail!("Running on unsupported os: {other}"),
+        };
+        let suffix = if consts::OS == "windows" {
+            ".zip"
+        } else {
+            ".tar.gz"
+        };
+        let asset_name = format!("delve-shim-dap-{}-{os}{suffix}", consts::ARCH);
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+            .with_context(|| format!("no asset found matching `{asset_name:?}`"))?;
+
+        Ok(AdapterVersion {
+            tag_name: release.tag_name,
+            url: asset.browser_download_url.clone(),
+        })
+    }
+    async fn install_shim(&self, delegate: &Arc<dyn DapDelegate>) -> anyhow::Result<PathBuf> {
+        if let Some(path) = self.shim_path.get().cloned() {
+            return Ok(path);
+        }
+
+        let asset = Self::fetch_latest_adapter_version(delegate).await?;
+        let ty = if consts::OS == "windows" {
+            DownloadedFileType::Zip
+        } else {
+            DownloadedFileType::GzipTar
+        };
+        download_adapter_from_github(
+            "delve-shim-dap".into(),
+            asset.clone(),
+            ty,
+            delegate.as_ref(),
+        )
+        .await?;
+
+        let path = paths::debug_adapters_dir()
+            .join("delve-shim-dap")
+            .join(format!("delve-shim-dap_{}", asset.tag_name))
+            .join(format!("delve-shim-dap{}", std::env::consts::EXE_SUFFIX));
+        self.shim_path.set(path.clone()).ok();
+
+        Ok(path)
+    }
 }
 
 #[async_trait(?Send)]
@@ -283,37 +351,31 @@ impl DebugAdapter for GoDebugAdapter {
         })
     }
 
-    fn validate_config(
-        &self,
-        config: &serde_json::Value,
-    ) -> Result<StartDebuggingRequestArgumentsRequest> {
-        let map = config.as_object().context("Config isn't an object")?;
-
-        let request_variant = map
-            .get("request")
-            .and_then(|val| val.as_str())
-            .context("request argument is not found or invalid")?;
-
-        match request_variant {
-            "launch" => Ok(StartDebuggingRequestArgumentsRequest::Launch),
-            "attach" => Ok(StartDebuggingRequestArgumentsRequest::Attach),
-            _ => Err(anyhow!("request must be either 'launch' or 'attach'")),
-        }
-    }
-
     fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
         let mut args = match &zed_scenario.request {
             dap::DebugRequest::Attach(attach_config) => {
                 json!({
+                    "request": "attach",
+                    "mode": "debug",
                     "processId": attach_config.process_id,
                 })
             }
-            dap::DebugRequest::Launch(launch_config) => json!({
-                "program": launch_config.program,
-                "cwd": launch_config.cwd,
-                "args": launch_config.args,
-                "env": launch_config.env_json()
-            }),
+            dap::DebugRequest::Launch(launch_config) => {
+                let mode = if launch_config.program != "." {
+                    "exec"
+                } else {
+                    "debug"
+                };
+
+                json!({
+                    "request": "launch",
+                    "mode": mode,
+                    "program": launch_config.program,
+                    "cwd": launch_config.cwd,
+                    "args": launch_config.args,
+                    "env": launch_config.env_json()
+                })
+            }
         };
 
         let map = args.as_object_mut().unwrap();
@@ -335,31 +397,104 @@ impl DebugAdapter for GoDebugAdapter {
         &self,
         delegate: &Arc<dyn DapDelegate>,
         task_definition: &DebugTaskDefinition,
-        _user_installed_path: Option<PathBuf>,
+        user_installed_path: Option<PathBuf>,
         _cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
-        let delve_path = delegate
-            .which(OsStr::new("dlv"))
-            .await
-            .and_then(|p| p.to_str().map(|p| p.to_string()))
-            .context("Dlv not found in path")?;
+        let adapter_path = paths::debug_adapters_dir().join(&Self::ADAPTER_NAME);
+        let dlv_path = adapter_path.join("dlv");
 
-        let tcp_connection = task_definition.tcp_connection.clone().unwrap_or_default();
-        let (host, port, timeout) = crate::configure_tcp_connection(tcp_connection).await?;
+        let delve_path = if let Some(path) = user_installed_path {
+            path.to_string_lossy().to_string()
+        } else if let Some(path) = delegate.which(OsStr::new("dlv")).await {
+            path.to_string_lossy().to_string()
+        } else if delegate.fs().is_file(&dlv_path).await {
+            dlv_path.to_string_lossy().to_string()
+        } else {
+            let go = delegate
+                .which(OsStr::new("go"))
+                .await
+                .context("Go not found in path. Please install Go first, then Dlv will be installed automatically.")?;
 
-        Ok(DebugAdapterBinary {
-            command: delve_path,
-            arguments: vec!["dap".into(), "--listen".into(), format!("{host}:{port}")],
-            cwd: Some(delegate.worktree_root_path().to_path_buf()),
-            envs: HashMap::default(),
-            connection: Some(adapters::TcpArguments {
+            let adapter_path = paths::debug_adapters_dir().join(&Self::ADAPTER_NAME);
+
+            let install_output = util::command::new_smol_command(&go)
+                .env("GO111MODULE", "on")
+                .env("GOBIN", &adapter_path)
+                .args(&["install", "github.com/go-delve/delve/cmd/dlv@latest"])
+                .output()
+                .await?;
+
+            if !install_output.status.success() {
+                bail!(
+                    "failed to install dlv via `go install`. stdout: {:?}, stderr: {:?}\n Please try installing it manually using 'go install github.com/go-delve/delve/cmd/dlv@latest'",
+                    String::from_utf8_lossy(&install_output.stdout),
+                    String::from_utf8_lossy(&install_output.stderr)
+                );
+            }
+
+            adapter_path.join("dlv").to_string_lossy().to_string()
+        };
+
+        let cwd = task_definition
+            .config
+            .get("cwd")
+            .and_then(|s| s.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| delegate.worktree_root_path().to_path_buf());
+
+        let arguments;
+        let command;
+        let connection;
+
+        let mut configuration = task_definition.config.clone();
+        if let Some(configuration) = configuration.as_object_mut() {
+            configuration
+                .entry("cwd")
+                .or_insert_with(|| delegate.worktree_root_path().to_string_lossy().into());
+        }
+
+        if let Some(connection_options) = &task_definition.tcp_connection {
+            command = None;
+            arguments = vec![];
+            let (host, port, timeout) =
+                crate::configure_tcp_connection(connection_options.clone()).await?;
+            connection = Some(TcpArguments {
                 host,
                 port,
                 timeout,
-            }),
+            });
+        } else {
+            let minidelve_path = self.install_shim(delegate).await?;
+            let (host, port, _) =
+                crate::configure_tcp_connection(TcpArgumentsTemplate::default()).await?;
+            command = Some(minidelve_path.to_string_lossy().into_owned());
+            connection = None;
+            arguments = if cfg!(windows) {
+                vec![
+                    delve_path,
+                    "dap".into(),
+                    "--listen".into(),
+                    format!("{}:{}", host, port),
+                    "--headless".into(),
+                ]
+            } else {
+                vec![
+                    delve_path,
+                    "dap".into(),
+                    "--listen".into(),
+                    format!("{}:{}", host, port),
+                ]
+            };
+        }
+        Ok(DebugAdapterBinary {
+            command,
+            arguments,
+            cwd: Some(cwd),
+            envs: HashMap::default(),
+            connection,
             request_args: StartDebuggingRequestArguments {
-                configuration: task_definition.config.clone(),
-                request: self.validate_config(&task_definition.config)?,
+                configuration,
+                request: self.request_kind(&task_definition.config)?,
             },
         })
     }
