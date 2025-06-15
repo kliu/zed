@@ -37,7 +37,7 @@ use util::ResultExt as _;
 use workspace::{
     CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
-    item::{BreadcrumbText, Item, ItemEvent, ItemHandle, TabContentParams},
+    item::{BreadcrumbText, Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
     searchable::SearchableItemHandle,
 };
 
@@ -219,7 +219,7 @@ impl ProjectDiff {
         };
         let repo = git_repo.read(cx);
 
-        let namespace = if repo.has_conflict(&entry.repo_path) {
+        let namespace = if repo.had_conflict_on_last_merge_head_change(&entry.repo_path) {
             CONFLICT_NAMESPACE
         } else if entry.status.is_created() {
             NEW_NAMESPACE
@@ -372,7 +372,7 @@ impl ProjectDiff {
                 };
                 let namespace = if GitPanelSettings::get_global(cx).sort_by_path {
                     TRACKED_NAMESPACE
-                } else if repo.has_conflict(&entry.repo_path) {
+                } else if repo.had_conflict_on_last_merge_head_change(&entry.repo_path) {
                     CONFLICT_NAMESPACE
                 } else if entry.status.is_created() {
                     NEW_NAMESPACE
@@ -632,12 +632,12 @@ impl Item for ProjectDiff {
 
     fn save(
         &mut self,
-        format: bool,
+        options: SaveOptions,
         project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        self.editor.save(format, project, window, cx)
+        self.editor.save(options, project, window, cx)
     }
 
     fn save_as(
@@ -1347,7 +1347,7 @@ mod tests {
 
     #[ctor::ctor]
     fn init_logger() {
-        env_logger::init();
+        zlog::init_test();
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -1387,6 +1387,7 @@ mod tests {
         fs.set_head_for_repo(
             path!("/project/.git").as_ref(),
             &[("foo.txt".into(), "foo\n".into())],
+            "deadbeef",
         );
         fs.set_index_for_repo(
             path!("/project/.git").as_ref(),
@@ -1394,7 +1395,7 @@ mod tests {
         );
         cx.run_until_parked();
 
-        let editor = diff.update(cx, |diff, _| diff.editor.clone());
+        let editor = diff.read_with(cx, |diff, _| diff.editor.clone());
         assert_state_with_diff(
             &editor,
             cx,
@@ -1523,10 +1524,11 @@ mod tests {
         fs.set_head_for_repo(
             path!("/project/.git").as_ref(),
             &[("foo".into(), "original\n".into())],
+            "deadbeef",
         );
         cx.run_until_parked();
 
-        let diff_editor = diff.update(cx, |diff, _| diff.editor.clone());
+        let diff_editor = diff.read_with(cx, |diff, _| diff.editor.clone());
 
         assert_state_with_diff(
             &diff_editor,
@@ -1563,7 +1565,15 @@ mod tests {
 
         cx.update_window_entity(&buffer_editor, |buffer_editor, window, cx| {
             buffer_editor.set_text("different\n", window, cx);
-            buffer_editor.save(false, project.clone(), window, cx)
+            buffer_editor.save(
+                SaveOptions {
+                    format: false,
+                    autosave: false,
+                },
+                project.clone(),
+                window,
+                cx,
+            )
         })
         .await
         .unwrap();
@@ -1642,7 +1652,7 @@ mod tests {
             workspace.active_item_as::<ProjectDiff>(cx).unwrap()
         });
         cx.focus(&item);
-        let editor = item.update(cx, |item, _| item.editor.clone());
+        let editor = item.read_with(cx, |item, _| item.editor.clone());
 
         let mut cx = EditorTestContext::for_editor_in(editor, cx).await;
 
@@ -1756,7 +1766,7 @@ mod tests {
             workspace.active_item_as::<ProjectDiff>(cx).unwrap()
         });
         cx.focus(&item);
-        let editor = item.update(cx, |item, _| item.editor.clone());
+        let editor = item.read_with(cx, |item, _| item.editor.clone());
 
         let mut cx = EditorTestContext::for_editor_in(editor, cx).await;
 

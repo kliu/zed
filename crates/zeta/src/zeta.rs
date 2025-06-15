@@ -335,6 +335,7 @@ impl Zeta {
 
         self.events.push_back(event);
         if self.events.len() >= MAX_EVENT_COUNT {
+            // These are halved instead of popping to improve prompt caching.
             self.events.drain(..MAX_EVENT_COUNT / 2);
         }
     }
@@ -1574,6 +1575,17 @@ impl inline_completion::EditPredictionProvider for ZetaInlineCompletionProvider 
             return;
         }
 
+        if self
+            .zeta
+            .read(cx)
+            .user_store
+            .read_with(cx, |user_store, _| {
+                user_store.account_too_young() || user_store.has_overdue_invoices()
+            })
+        {
+            return;
+        }
+
         if let Some(current_completion) = self.current_completion.as_ref() {
             let snapshot = buffer.read(cx).snapshot();
             if current_completion
@@ -2129,8 +2141,6 @@ mod tests {
 
     #[ctor::ctor]
     fn init_logger() {
-        if std::env::var("RUST_LOG").is_ok() {
-            env_logger::init();
-        }
+        zlog::init_test();
     }
 }
