@@ -33,6 +33,7 @@ use std::{
 use terminal_view::terminal_panel::TerminalPanel;
 use tests::{active_debug_session_panel, init_test, init_test_workspace};
 use util::path;
+use workspace::item::SaveOptions;
 use workspace::{Item, dock::Panel};
 
 #[gpui::test]
@@ -443,18 +444,20 @@ async fn test_handle_start_debugging_request(
         .update(cx, |workspace, _window, cx| {
             let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
 
-            // Active session does not change on spawn.
+            // Active session changes on spawn, as the parent has never stopped.
             let active_session = debug_panel
                 .read(cx)
                 .active_session()
                 .unwrap()
                 .read(cx)
                 .session(cx);
-
-            assert_eq!(active_session, sessions[0].read(cx).session(cx));
-            assert!(active_session.read(cx).parent_session().is_none());
-
             let current_sessions = debug_panel.read(cx).sessions();
+            assert_eq!(active_session, current_sessions[1].read(cx).session(cx));
+            assert_eq!(
+                active_session.read(cx).parent_session(),
+                Some(&current_sessions[0].read(cx).session(cx))
+            );
+
             assert_eq!(current_sessions.len(), 2);
             assert_eq!(current_sessions[0], sessions[0]);
 
@@ -468,14 +471,19 @@ async fn test_handle_start_debugging_request(
 
             // We should preserve the original binary (params to spawn process etc.) except for launch params
             // (as they come from reverse spawn request).
-            let mut original_binary = parent_session.read(cx).binary().clone();
+            let mut original_binary = parent_session.read(cx).binary().cloned().unwrap();
             original_binary.request_args = StartDebuggingRequestArguments {
                 request: StartDebuggingRequestArgumentsRequest::Launch,
                 configuration: fake_config.clone(),
             };
 
             assert_eq!(
-                current_sessions[1].read(cx).session(cx).read(cx).binary(),
+                current_sessions[1]
+                    .read(cx)
+                    .session(cx)
+                    .read(cx)
+                    .binary()
+                    .unwrap(),
                 &original_binary
             );
         })
@@ -1015,7 +1023,7 @@ async fn test_debug_panel_item_thread_status_reset_on_failure(
     cx.run_until_parked();
 
     let running_state = active_debug_session_panel(workspace, cx)
-        .update(cx, |item, _| item.running_state().clone());
+        .read_with(cx, |item, _| item.running_state().clone());
 
     cx.run_until_parked();
     let thread_id = ThreadId(1);
@@ -1213,7 +1221,15 @@ async fn test_send_breakpoints_when_editor_has_been_saved(
 
     editor
         .update_in(cx, |editor, window, cx| {
-            editor.save(true, project.clone(), window, cx)
+            editor.save(
+                SaveOptions {
+                    format: true,
+                    autosave: false,
+                },
+                project.clone(),
+                window,
+                cx,
+            )
         })
         .await
         .unwrap();
@@ -1439,13 +1455,7 @@ async fn test_we_send_arguments_from_user_config(
             client.on_request::<dap::requests::Launch, _>(move |_, args| {
                 launch_handler_called.store(true, Ordering::SeqCst);
 
-                let obj = args.raw.as_object().unwrap();
-                let sent_definition = serde_json::from_value::<DebugTaskDefinition>(
-                    obj.get(&"raw_request".to_owned()).unwrap().clone(),
-                )
-                .unwrap();
-
-                assert_eq!(sent_definition, debug_definition);
+                assert_eq!(args.raw, debug_definition.config);
 
                 Ok(())
             });
