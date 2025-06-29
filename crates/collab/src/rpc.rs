@@ -4,13 +4,17 @@ use crate::api::billing::find_or_create_billing_customer;
 use crate::api::{CloudflareIpCountryHeader, SystemIdHeader};
 use crate::db::billing_subscription::SubscriptionKind;
 use crate::llm::db::LlmDatabase;
-use crate::llm::{AGENT_EXTENDED_TRIAL_FEATURE_FLAG, LlmTokenClaims};
+use crate::llm::{
+    AGENT_EXTENDED_TRIAL_FEATURE_FLAG, BYPASS_ACCOUNT_AGE_CHECK_FEATURE_FLAG, LlmTokenClaims,
+    MIN_ACCOUNT_AGE_FOR_LLM_USE,
+};
+use crate::stripe_client::StripeCustomerId;
 use crate::{
     AppState, Error, Result, auth,
     db::{
         self, BufferId, Capability, Channel, ChannelId, ChannelRole, ChannelsForUser,
         CreatedChannelMessage, Database, InviteMemberResult, MembershipUpdated, MessageId,
-        NotificationId, Project, ProjectId, RejoinedProject, RemoveChannelMemberResult, ReplicaId,
+        NotificationId, ProjectId, RejoinedProject, RemoveChannelMemberResult,
         RespondToChannelInvite, RoomId, ServerId, UpdatedChannelMessage, User, UserId,
     },
     executor::Executor,
@@ -64,7 +68,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
@@ -85,9 +89,35 @@ pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MESSAGE_COUNT_PER_PAGE: usize = 100;
 const MAX_MESSAGE_LEN: usize = 1024;
 const NOTIFICATION_COUNT_PER_PAGE: usize = 50;
+const MAX_CONCURRENT_CONNECTIONS: usize = 512;
+
+static CONCURRENT_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 type MessageHandler =
     Box<dyn Send + Sync + Fn(Box<dyn AnyTypedEnvelope>, Session) -> BoxFuture<'static, ()>>;
+
+pub struct ConnectionGuard;
+
+impl ConnectionGuard {
+    pub fn try_acquire() -> Result<Self, ()> {
+        let current_connections = CONCURRENT_CONNECTIONS.fetch_add(1, SeqCst);
+        if current_connections >= MAX_CONCURRENT_CONNECTIONS {
+            CONCURRENT_CONNECTIONS.fetch_sub(1, SeqCst);
+            tracing::error!(
+                "too many concurrent connections: {}",
+                current_connections + 1
+            );
+            return Err(());
+        }
+        Ok(ConnectionGuard)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        CONCURRENT_CONNECTIONS.fetch_sub(1, SeqCst);
+    }
+}
 
 struct Response<R> {
     peer: Arc<Peer>,
@@ -110,6 +140,13 @@ pub enum Principal {
 }
 
 impl Principal {
+    fn user(&self) -> &User {
+        match self {
+            Principal::User(user) => user,
+            Principal::Impersonated { user, .. } => user,
+        }
+    }
+
     fn update_span(&self, span: &tracing::Span) {
         match &self {
             Principal::User(user) => {
@@ -142,7 +179,7 @@ struct Session {
 }
 
 impl Session {
-    async fn db(&self) -> tokio::sync::MutexGuard<DbHandle> {
+    async fn db(&self) -> tokio::sync::MutexGuard<'_, DbHandle> {
         #[cfg(test)]
         tokio::task::yield_now().await;
         let guard = self.db.lock().await;
@@ -286,6 +323,7 @@ impl Server {
             .add_request_handler(forward_read_only_project_request::<proto::SynchronizeBuffers>)
             .add_request_handler(forward_read_only_project_request::<proto::InlayHints>)
             .add_request_handler(forward_read_only_project_request::<proto::ResolveInlayHint>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetColorPresentation>)
             .add_request_handler(forward_mutating_project_request::<proto::GetCodeLens>)
             .add_request_handler(forward_read_only_project_request::<proto::OpenBufferByPath>)
             .add_request_handler(forward_read_only_project_request::<proto::GitGetBranches>)
@@ -304,6 +342,7 @@ impl Server {
             .add_request_handler(
                 forward_read_only_project_request::<proto::LanguageServerIdForName>,
             )
+            .add_request_handler(forward_read_only_project_request::<proto::GetDocumentDiagnostics>)
             .add_request_handler(
                 forward_mutating_project_request::<proto::RegisterBufferWithLanguageServers>,
             )
@@ -346,6 +385,9 @@ impl Server {
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferReloaded>)
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferSaved>)
             .add_message_handler(broadcast_project_message_from_host::<proto::UpdateDiffBases>)
+            .add_message_handler(
+                broadcast_project_message_from_host::<proto::PullWorkspaceDiagnostics>,
+            )
             .add_request_handler(get_users)
             .add_request_handler(fuzzy_search_users)
             .add_request_handler(request_contact)
@@ -376,6 +418,7 @@ impl Server {
             .add_request_handler(get_notifications)
             .add_request_handler(mark_notification_as_read)
             .add_request_handler(move_channel)
+            .add_request_handler(reorder_channel)
             .add_request_handler(follow)
             .add_message_handler(unfollow)
             .add_message_handler(update_followers)
@@ -425,6 +468,16 @@ impl Server {
                 tracing::info!("waiting for cleanup timeout");
                 timeout.await;
                 tracing::info!("cleanup timeout expired, retrieving stale rooms");
+
+                app_state
+                    .db
+                    .delete_stale_channel_chat_participants(
+                        &app_state.config.zed_environment,
+                        server_id,
+                    )
+                    .await
+                    .trace_err();
+
                 if let Some((room_ids, channel_ids)) = app_state
                     .db
                     .stale_server_resource_ids(&app_state.config.zed_environment, server_id)
@@ -545,6 +598,21 @@ impl Server {
                         }
                     }
                 }
+
+                app_state
+                    .db
+                    .delete_stale_channel_chat_participants(
+                        &app_state.config.zed_environment,
+                        server_id,
+                    )
+                    .await
+                    .trace_err();
+
+                app_state
+                    .db
+                    .clear_old_worktree_entries(server_id)
+                    .await
+                    .trace_err();
 
                 app_state
                     .db
@@ -684,6 +752,7 @@ impl Server {
         system_id: Option<String>,
         send_connection_id: Option<oneshot::Sender<ConnectionId>>,
         executor: Executor,
+        connection_guard: Option<ConnectionGuard>,
     ) -> impl Future<Output = ()> + use<> {
         let this = self.clone();
         let span = info_span!("handle connection", %address,
@@ -704,6 +773,7 @@ impl Server {
                 tracing::error!("server is tearing down");
                 return
             }
+
             let (connection_id, handle_io, mut incoming_rx) = this
                 .peer
                 .add_connection(connection, {
@@ -741,10 +811,11 @@ impl Server {
                 supermaven_client,
             };
 
-            if let Err(error) = this.send_initial_client_update(connection_id, &principal, zed_version, send_connection_id, &session).await {
+            if let Err(error) = this.send_initial_client_update(connection_id, zed_version, send_connection_id, &session).await {
                 tracing::error!(?error, "failed to send initial client update");
                 return;
             }
+            drop(connection_guard);
 
             let handle_io = handle_io.fuse();
             futures::pin_mut!(handle_io);
@@ -825,7 +896,6 @@ impl Server {
     async fn send_initial_client_update(
         &self,
         connection_id: ConnectionId,
-        principal: &Principal,
         zed_version: ZedVersion,
         mut send_connection_id: Option<oneshot::Sender<ConnectionId>>,
         session: &Session,
@@ -841,7 +911,7 @@ impl Server {
             let _ = send_connection_id.send(connection_id);
         }
 
-        match principal {
+        match &session.principal {
             Principal::User(user) | Principal::Impersonated { user, admin: _ } => {
                 if !user.connected_once {
                     self.peer.send(connection_id, proto::ShowContacts {})?;
@@ -851,7 +921,7 @@ impl Server {
                         .await?;
                 }
 
-                update_user_plan(user.id, session).await?;
+                update_user_plan(session).await?;
 
                 let contacts = self.app_state.db.get_contacts(user.id).await?;
 
@@ -941,10 +1011,10 @@ impl Server {
             .context("user not found")?;
 
         let update_user_plan = make_update_user_plan_message(
+            &user,
+            user.admin,
             &self.app_state.db,
             self.app_state.llm_db.clone(),
-            user_id,
-            user.admin,
         )
         .await?;
 
@@ -967,7 +1037,7 @@ impl Server {
         }
     }
 
-    pub async fn snapshot(self: &Arc<Self>) -> ServerSnapshot {
+    pub async fn snapshot(self: &Arc<Self>) -> ServerSnapshot<'_> {
         ServerSnapshot {
             connection_pool: ConnectionPoolGuard {
                 guard: self.connection_pool.lock(),
@@ -1117,6 +1187,19 @@ pub async fn handle_websocket_request(
     }
 
     let socket_address = socket_address.to_string();
+
+    // Acquire connection guard before WebSocket upgrade
+    let connection_guard = match ConnectionGuard::try_acquire() {
+        Ok(guard) => guard,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many concurrent connections",
+            )
+                .into_response();
+        }
+    };
+
     ws.on_upgrade(move |socket| {
         let socket = socket
             .map_ok(to_tungstenite_message)
@@ -1134,6 +1217,7 @@ pub async fn handle_websocket_request(
                     system_id_header.map(|header| header.to_string()),
                     None,
                     Executor::Production,
+                    Some(connection_guard),
                 )
                 .await;
         }
@@ -1807,28 +1891,16 @@ async fn join_project(
 
     let db = session.db().await;
     let (project, replica_id) = &mut *db
-        .join_project(project_id, session.connection_id, session.user_id())
+        .join_project(
+            project_id,
+            session.connection_id,
+            session.user_id(),
+            request.committer_name.clone(),
+            request.committer_email.clone(),
+        )
         .await?;
     drop(db);
     tracing::info!(%project_id, "join remote project");
-    join_project_internal(response, session, project, replica_id)
-}
-
-trait JoinProjectInternalResponse {
-    fn send(self, result: proto::JoinProjectResponse) -> Result<()>;
-}
-impl JoinProjectInternalResponse for Response<proto::JoinProject> {
-    fn send(self, result: proto::JoinProjectResponse) -> Result<()> {
-        Response::<proto::JoinProject>::send(self, result)
-    }
-}
-
-fn join_project_internal(
-    response: impl JoinProjectInternalResponse,
-    session: Session,
-    project: &mut Project,
-    replica_id: &ReplicaId,
-) -> Result<()> {
     let collaborators = project
         .collaborators
         .iter()
@@ -1856,6 +1928,8 @@ fn join_project_internal(
             replica_id: replica_id.0 as u32,
             user_id: guest_user_id.to_proto(),
             is_host: false,
+            committer_name: request.committer_name.clone(),
+            committer_email: request.committer_email.clone(),
         }),
     };
 
@@ -1934,6 +2008,7 @@ fn join_project_internal(
             session.connection_id,
             proto::UpdateLanguageServer {
                 project_id: project_id.to_proto(),
+                server_name: Some(language_server.name.clone()),
                 language_server_id: language_server.id,
                 variant: Some(
                     proto::update_language_server::Variant::DiskBasedDiagnosticsUpdated(
@@ -2484,7 +2559,6 @@ async fn get_users(
             id: user.id.to_proto(),
             avatar_url: format!("https://github.com/{}.png?size=128", user.github_login),
             github_login: user.github_login,
-            email: user.email_address,
             name: user.name,
         })
         .collect();
@@ -2518,7 +2592,6 @@ async fn fuzzy_search_users(
             avatar_url: format!("https://github.com/{}.png?size=128", user.github_login),
             github_login: user.github_login,
             name: user.name,
-            email: user.email_address,
         })
         .collect();
     response.send(proto::UsersResponse { users })?;
@@ -2707,25 +2780,25 @@ async fn current_plan(db: &Arc<Database>, user_id: UserId, is_staff: bool) -> Re
 }
 
 async fn make_update_user_plan_message(
+    user: &User,
+    is_staff: bool,
     db: &Arc<Database>,
     llm_db: Option<Arc<LlmDatabase>>,
-    user_id: UserId,
-    is_staff: bool,
 ) -> Result<proto::UpdateUserPlan> {
-    let feature_flags = db.get_user_flags(user_id).await?;
-    let plan = current_plan(db, user_id, is_staff).await?;
-    let billing_customer = db.get_billing_customer_by_user_id(user_id).await?;
-    let billing_preferences = db.get_billing_preferences(user_id).await?;
+    let feature_flags = db.get_user_flags(user.id).await?;
+    let plan = current_plan(db, user.id, is_staff).await?;
+    let billing_customer = db.get_billing_customer_by_user_id(user.id).await?;
+    let billing_preferences = db.get_billing_preferences(user.id).await?;
 
     let (subscription_period, usage) = if let Some(llm_db) = llm_db {
-        let subscription = db.get_active_billing_subscription(user_id).await?;
+        let subscription = db.get_active_billing_subscription(user.id).await?;
 
         let subscription_period =
             crate::db::billing_subscription::Model::current_period(subscription, is_staff);
 
         let usage = if let Some((period_start_at, period_end_at)) = subscription_period {
             llm_db
-                .get_subscription_usage_for_period(user_id, period_start_at, period_end_at)
+                .get_subscription_usage_for_period(user.id, period_start_at, period_end_at)
                 .await?
         } else {
             None
@@ -2736,9 +2809,17 @@ async fn make_update_user_plan_message(
         (None, None)
     };
 
+    let bypass_account_age_check = feature_flags
+        .iter()
+        .any(|flag| flag == BYPASS_ACCOUNT_AGE_CHECK_FEATURE_FLAG);
+    let account_too_young = !matches!(plan, proto::Plan::ZedPro)
+        && !bypass_account_age_check
+        && user.account_age() < MIN_ACCOUNT_AGE_FOR_LLM_USE;
+
     Ok(proto::UpdateUserPlan {
         plan: plan.into(),
         trial_started_at: billing_customer
+            .as_ref()
             .and_then(|billing_customer| billing_customer.trial_started_at)
             .map(|trial_started_at| trial_started_at.and_utc().timestamp() as u64),
         is_usage_based_billing_enabled: if is_staff {
@@ -2752,6 +2833,9 @@ async fn make_update_user_plan_message(
                 ended_at: ended_at.timestamp() as u64,
             }
         }),
+        account_too_young: Some(account_too_young),
+        has_overdue_invoices: billing_customer
+            .map(|billing_customer| billing_customer.has_overdue_invoices),
         usage: usage.map(|usage| {
             let plan = match plan {
                 proto::Plan::Free => zed_llm_client::Plan::ZedFree,
@@ -2808,14 +2892,14 @@ async fn make_update_user_plan_message(
     })
 }
 
-async fn update_user_plan(user_id: UserId, session: &Session) -> Result<()> {
+async fn update_user_plan(session: &Session) -> Result<()> {
     let db = session.db().await;
 
     let update_user_plan = make_update_user_plan_message(
+        session.principal.user(),
+        session.is_staff(),
         &db.0,
         session.app_state.llm_db.clone(),
-        user_id,
-        session.is_staff(),
     )
     .await?;
 
@@ -3175,6 +3259,51 @@ async fn move_channel(
         };
 
         session.peer.send(connection_id, update.clone())?;
+    }
+
+    response.send(Ack {})?;
+    Ok(())
+}
+
+async fn reorder_channel(
+    request: proto::ReorderChannel,
+    response: Response<proto::ReorderChannel>,
+    session: Session,
+) -> Result<()> {
+    let channel_id = ChannelId::from_proto(request.channel_id);
+    let direction = request.direction();
+
+    let updated_channels = session
+        .db()
+        .await
+        .reorder_channel(channel_id, direction, session.user_id())
+        .await?;
+
+    if let Some(root_id) = updated_channels.first().map(|channel| channel.root_id()) {
+        let connection_pool = session.connection_pool().await;
+        for (connection_id, role) in connection_pool.channel_connection_ids(root_id) {
+            let channels = updated_channels
+                .iter()
+                .filter_map(|channel| {
+                    if role.can_see_channel(channel.visibility) {
+                        Some(channel.to_proto())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if channels.is_empty() {
+                continue;
+            }
+
+            let update = proto::UpdateChannels {
+                channels,
+                ..Default::default()
+            };
+
+            session.peer.send(connection_id, update.clone())?;
+        }
     }
 
     response.send(Ack {})?;
@@ -3986,9 +4115,6 @@ async fn accept_terms_of_service(
     Ok(())
 }
 
-/// The minimum account age an account must have in order to use the LLM service.
-pub const MIN_ACCOUNT_AGE_FOR_LLM_USE: chrono::Duration = chrono::Duration::days(30);
-
 async fn get_llm_api_token(
     _request: proto::GetLlmToken,
     response: Response<proto::GetLlmToken>,
@@ -4020,31 +4146,26 @@ async fn get_llm_api_token(
         .as_ref()
         .context("failed to retrieve Stripe billing object")?;
 
-    let billing_customer =
-        if let Some(billing_customer) = db.get_billing_customer_by_user_id(user.id).await? {
-            billing_customer
-        } else {
-            let customer_id = stripe_billing
-                .find_or_create_customer_by_email(user.email_address.as_deref())
-                .await?;
+    let billing_customer = if let Some(billing_customer) =
+        db.get_billing_customer_by_user_id(user.id).await?
+    {
+        billing_customer
+    } else {
+        let customer_id = stripe_billing
+            .find_or_create_customer_by_email(user.email_address.as_deref())
+            .await?;
 
-            find_or_create_billing_customer(
-                &session.app_state,
-                &stripe_client,
-                stripe::Expandable::Id(customer_id),
-            )
+        find_or_create_billing_customer(&session.app_state, stripe_client.as_ref(), &customer_id)
             .await?
             .context("billing customer not found")?
-        };
+    };
 
     let billing_subscription =
         if let Some(billing_subscription) = db.get_active_billing_subscription(user.id).await? {
             billing_subscription
         } else {
-            let stripe_customer_id = billing_customer
-                .stripe_customer_id
-                .parse::<stripe::CustomerId>()
-                .context("failed to parse Stripe customer ID from database")?;
+            let stripe_customer_id =
+                StripeCustomerId(billing_customer.stripe_customer_id.clone().into());
 
             let stripe_subscription = stripe_billing
                 .subscribe_to_zed_free(stripe_customer_id)
@@ -4067,6 +4188,7 @@ async fn get_llm_api_token(
     let token = LlmTokenClaims::create(
         &user,
         session.is_staff(),
+        billing_customer,
         billing_preferences,
         &flags,
         billing_subscription,
