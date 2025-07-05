@@ -108,14 +108,14 @@ impl Project {
                 });
             }
         }
-        let settings = TerminalSettings::get(settings_location, cx).clone();
+        let venv = TerminalSettings::get(settings_location, cx)
+            .detect_venv
+            .clone();
 
         cx.spawn(async move |project, cx| {
-            let python_venv_directory = if let Some(path) = path.clone() {
+            let python_venv_directory = if let Some(path) = path {
                 project
-                    .update(cx, |this, cx| {
-                        this.python_venv_directory(path, settings.detect_venv.clone(), cx)
-                    })?
+                    .update(cx, |this, cx| this.python_venv_directory(path, venv, cx))?
                     .await
             } else {
                 None
@@ -148,7 +148,7 @@ impl Project {
         let ssh_details = self.ssh_details(cx);
         let settings = self.terminal_settings(&path, cx).clone();
 
-        let builder = ShellBuilder::new(ssh_details.is_none(), &settings.shell);
+        let builder = ShellBuilder::new(ssh_details.is_none(), &settings.shell).non_interactive();
         let (command, args) = builder.build(command, &Vec::new());
 
         let mut env = self
@@ -264,7 +264,7 @@ impl Project {
                             },
                         )
                     }
-                    None => (None, settings.shell.clone()),
+                    None => (None, settings.shell),
                 }
             }
             TerminalKind::Task(spawn_task) => {
@@ -514,7 +514,7 @@ impl Project {
         terminal_handle: &Entity<Terminal>,
         cx: &mut App,
     ) {
-        terminal_handle.update(cx, |terminal, _| terminal.input(command));
+        terminal_handle.update(cx, |terminal, _| terminal.input(command.into_bytes()));
     }
 
     pub fn local_terminal_handles(&self) -> &Vec<WeakEntity<terminal::Terminal>> {
