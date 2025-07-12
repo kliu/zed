@@ -30,13 +30,15 @@ use smallvec::SmallVec;
 pub use test_context::*;
 use util::{ResultExt, debug_panic};
 
+#[cfg(any(feature = "inspector", debug_assertions))]
+use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Asset,
     AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle, DispatchPhase, DisplayId,
     EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext,
     Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, Point, PromptBuilder, PromptHandle, PromptLevel,
-    Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString,
+    PlatformDisplay, PlatformKeyboardLayout, Point, PromptBuilder, PromptButton, PromptHandle,
+    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
     SubscriberSet, Subscription, SvgRenderer, Task, TextSystem, Window, WindowAppearance,
     WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
@@ -62,7 +64,7 @@ pub struct AppCell {
 impl AppCell {
     #[doc(hidden)]
     #[track_caller]
-    pub fn borrow(&self) -> AppRef {
+    pub fn borrow(&self) -> AppRef<'_> {
         if option_env!("TRACK_THREAD_BORROWS").is_some() {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
@@ -72,7 +74,7 @@ impl AppCell {
 
     #[doc(hidden)]
     #[track_caller]
-    pub fn borrow_mut(&self) -> AppRefMut {
+    pub fn borrow_mut(&self) -> AppRefMut<'_> {
         if option_env!("TRACK_THREAD_BORROWS").is_some() {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
@@ -82,7 +84,7 @@ impl AppCell {
 
     #[doc(hidden)]
     #[track_caller]
-    pub fn try_borrow_mut(&self) -> Result<AppRefMut, BorrowMutError> {
+    pub fn try_borrow_mut(&self) -> Result<AppRefMut<'_>, BorrowMutError> {
         if option_env!("TRACK_THREAD_BORROWS").is_some() {
             let thread_id = std::thread::current().id();
             eprintln!("borrowed {thread_id:?}");
@@ -270,6 +272,7 @@ pub struct App {
     // TypeId is the type of the event that the listener callback expects
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
     pub(crate) keystroke_observers: SubscriberSet<(), KeystrokeObserver>,
+    pub(crate) keystroke_interceptors: SubscriberSet<(), KeystrokeObserver>,
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
     pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
@@ -281,6 +284,10 @@ pub struct App {
     pub(crate) window_invalidators_by_entity:
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) inspector_element_registry: InspectorElementRegistry,
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     quitting: bool,
@@ -338,6 +345,7 @@ impl App {
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
+                keystroke_interceptors: SubscriberSet::new(),
                 keyboard_layout_observers: SubscriberSet::new(),
                 global_observers: SubscriberSet::new(),
                 quit_observers: SubscriberSet::new(),
@@ -345,6 +353,10 @@ impl App {
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
                 prompt_builder: Some(PromptBuilder::Default),
+                #[cfg(any(feature = "inspector", debug_assertions))]
+                inspector_renderer: None,
+                #[cfg(any(feature = "inspector", debug_assertions))]
+                inspector_element_registry: InspectorElementRegistry::default(),
                 quitting: false,
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
@@ -899,7 +911,7 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                 {
-                    self.update_window(window, |_, window, cx| window.draw(cx))
+                    self.update_window(window, |_, window, cx| window.draw(cx).clear())
                         .unwrap();
                 }
 
@@ -1312,6 +1324,32 @@ impl App {
         )
     }
 
+    /// Register a callback to be invoked when a keystroke is received by the application
+    /// in any window. Note that this fires _before_ all other action and event mechanisms have resolved
+    /// unlike [`App::observe_keystrokes`] which fires after. This means that `cx.stop_propagation` calls
+    /// within interceptors will prevent action dispatch
+    pub fn intercept_keystrokes(
+        &mut self,
+        mut f: impl FnMut(&KeystrokeEvent, &mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        fn inner(
+            keystroke_interceptors: &SubscriberSet<(), KeystrokeObserver>,
+            handler: KeystrokeObserver,
+        ) -> Subscription {
+            let (subscription, activate) = keystroke_interceptors.insert((), handler);
+            activate();
+            subscription
+        }
+
+        inner(
+            &mut self.keystroke_interceptors,
+            Box::new(move |event, window, cx| {
+                f(event, window, cx);
+                true
+            }),
+        )
+    }
+
     /// Register key bindings.
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.keymap.borrow_mut().add_bindings(bindings);
@@ -1322,6 +1360,11 @@ impl App {
     pub fn clear_key_bindings(&mut self) {
         self.keymap.borrow_mut().clear();
         self.pending_effects.push_back(Effect::RefreshWindows);
+    }
+
+    /// Get all key bindings in the app.
+    pub fn key_bindings(&self) -> Rc<RefCell<Keymap>> {
+        self.keymap.clone()
     }
 
     /// Register a global listener for actions invoked via the keyboard.
@@ -1364,7 +1407,7 @@ impl App {
 
     /// Get all action names that have been registered. Note that registration only allows for
     /// actions to be built dynamically, and is unrelated to binding actions in the element tree.
-    pub fn all_action_names(&self) -> &[SharedString] {
+    pub fn all_action_names(&self) -> &[&'static str] {
         self.actions.all_action_names()
     }
 
@@ -1378,14 +1421,24 @@ impl App {
     /// Get all non-internal actions that have been registered, along with their schemas.
     pub fn action_schemas(
         &self,
-        generator: &mut schemars::r#gen::SchemaGenerator,
-    ) -> Vec<(SharedString, Option<schemars::schema::Schema>)> {
+        generator: &mut schemars::SchemaGenerator,
+    ) -> Vec<(&'static str, Option<schemars::Schema>)> {
         self.actions.action_schemas(generator)
     }
 
-    /// Get a list of all deprecated action aliases and their canonical names.
-    pub fn action_deprecations(&self) -> &HashMap<SharedString, SharedString> {
-        self.actions.action_deprecations()
+    /// Get a map from a deprecated action name to the canonical name.
+    pub fn deprecated_actions_to_preferred_actions(&self) -> &HashMap<&'static str, &'static str> {
+        self.actions.deprecated_aliases()
+    }
+
+    /// Get a map from an action name to the deprecation messages.
+    pub fn action_deprecation_messages(&self) -> &HashMap<&'static str, &'static str> {
+        self.actions.deprecation_messages()
+    }
+
+    /// Get a map from an action name to the documentation.
+    pub fn action_documentation(&self) -> &HashMap<&'static str, &'static str> {
+        self.actions.documentation()
     }
 
     /// Register a callback to be invoked when the application is about to quit.
@@ -1549,10 +1602,30 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Gets the cursor style of the currently active drag operation.
+    pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
+        self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
+    }
+
     /// Stops active drag and clears any related effects.
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
             self.active_drag = None;
+            window.refresh();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets the cursor style for the currently active drag operation.
+    pub fn set_active_drag_cursor_style(
+        &mut self,
+        cursor_style: CursorStyle,
+        window: &mut Window,
+    ) -> bool {
+        if let Some(ref mut drag) = self.active_drag {
+            drag.cursor_style = Some(cursor_style);
             window.refresh();
             true
         } else {
@@ -1568,14 +1641,14 @@ impl App {
             PromptLevel,
             &str,
             Option<&str>,
-            &[&str],
+            &[PromptButton],
             PromptHandle,
             &mut Window,
             &mut App,
         ) -> RenderablePromptHandle
         + 'static,
     ) {
-        self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)))
+        self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)));
     }
 
     /// Reset the prompt builder to the default implementation.
@@ -1655,7 +1728,7 @@ impl App {
 
     /// Removes an image from the sprite atlas on all windows.
     ///
-    /// If the current window is being updated, it will be removed from `App.windows``, you can use `current_window` to specify the current window.
+    /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
@@ -1667,6 +1740,21 @@ impl App {
         if let Some(window) = current_window {
             _ = window.drop_image(image);
         }
+    }
+
+    /// Sets the renderer for the inspector.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn set_inspector_renderer(&mut self, f: crate::InspectorRenderer) {
+        self.inspector_renderer = Some(f);
+    }
+
+    /// Registers a renderer specific to an inspector state.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn register_inspector_element<T: 'static, R: crate::IntoElement>(
+        &mut self,
+        f: impl 'static + Fn(crate::InspectorElementId, &T, &mut Window, &mut App) -> R,
+    ) {
+        self.inspector_element_registry.register(f);
     }
 
     /// Initializes gpui's default colors for the application.

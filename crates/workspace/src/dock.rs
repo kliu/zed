@@ -221,9 +221,9 @@ pub enum DockPosition {
 impl DockPosition {
     fn label(&self) -> &'static str {
         match self {
-            Self::Left => "left",
-            Self::Bottom => "bottom",
-            Self::Right => "right",
+            Self::Left => "Left",
+            Self::Bottom => "Bottom",
+            Self::Right => "Right",
         }
     }
 
@@ -686,6 +686,19 @@ impl Dock {
         }
     }
 
+    pub fn resize_all_panels(
+        &mut self,
+        size: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in &mut self.panel_entries {
+            let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
+            entry.panel.set_size(size, window, cx);
+        }
+        cx.notify();
+    }
+
     pub fn toggle_action(&self) -> Box<dyn Action> {
         match self.position {
             DockPosition::Left => crate::ToggleLeftDock.boxed_clone(),
@@ -851,7 +864,7 @@ impl Render for PanelButtons {
                     let action = dock.toggle_action();
 
                     let tooltip: SharedString =
-                        format!("Close {} dock", dock.position.label()).into();
+                        format!("Close {} Dock", dock.position.label()).into();
 
                     (action, tooltip)
                 } else {
@@ -889,7 +902,7 @@ impl Render for PanelButtons {
                         })
                         .anchor(menu_anchor)
                         .attach(menu_attach)
-                        .trigger(move |is_active| {
+                        .trigger(move |is_active, _window, _cx| {
                             IconButton::new(name, icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
@@ -910,6 +923,7 @@ impl Render for PanelButtons {
             .collect();
 
         let has_buttons = !buttons.is_empty();
+
         h_flex()
             .gap_1()
             .children(buttons)
@@ -942,7 +956,7 @@ pub mod test {
         pub focus_handle: FocusHandle,
         pub size: Pixels,
     }
-    actions!(test, [ToggleTestPanel]);
+    actions!(test_only, [ToggleTestPanel]);
 
     impl EventEmitter<PanelEvent> for TestPanel {}
 
